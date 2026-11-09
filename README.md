@@ -1,6 +1,24 @@
-# chat-hygiene
+<p align="center">
+  <img src="logo-200.png" alt="chat-hygiene" width="120" height="120" />
+</p>
 
-Report and **compress** / **expand** oversized coding-agent chats (Cursor, Claude Code, Codex).
+<h1 align="center">chat-hygiene</h1>
+
+<p align="center">
+  Report, compress, and expand oversized coding-agent chats<br/>
+  (Cursor, Claude Code, Codex).
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3%20stdlib-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3 stdlib" />
+  <img src="https://img.shields.io/badge/deps-none-brightgreen?style=flat" alt="No dependencies" />
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat" alt="macOS and Linux" />
+  <img src="https://img.shields.io/badge/agents-Cursor%20%7C%20Claude%20%7C%20Codex-8A2BE2?style=flat" alt="Cursor Claude Codex" />
+  <img src="https://img.shields.io/badge/shell-bash%20%7C%20zsh-4EAA25?style=flat&logo=gnubash&logoColor=white" alt="bash and zsh" />
+  <a href="https://github.com/dineybomfim/chat-hygiene/stargazers">
+    <img src="https://img.shields.io/github/stars/dineybomfim/chat-hygiene?style=flat" alt="Stars" />
+  </a>
+</p>
 
 Python 3 stdlib only. No pip packages. Installs into your home folder (no admin).
 
