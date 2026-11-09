@@ -5,8 +5,23 @@
 <h1 align="center">chat-hygiene</h1>
 
 <p align="center">
-  Report, compress, and expand oversized coding-agent chats<br/>
-  (Cursor, Claude Code, Codex).
+  <strong>Stop paying tokens for chats you already finished.</strong>
+</p>
+
+<p align="center">
+  Coding agents (Cursor, Claude Code, Codex) keep every turn on disk. A long<br/>
+  thread becomes a multi‑megabyte transcript: slower IDE/indexing, more disk,<br/>
+  and—worst—huge @‑attachments and agent re‑reads that burn <strong>context window</strong><br/>
+  and <strong>API tokens</strong> on noise you no longer need. Past decisions get buried in<br/>
+  the raw log instead of a short, reusable summary.
+</p>
+
+<p align="center">
+  <strong>chat-hygiene</strong> ranks oversized chats, helps you <strong>summarize</strong> what mattered,<br/>
+  then <strong>compresses</strong> the original to a zip + ultra‑summary (with a restore<br/>
+  manifest) and leaves a tiny stub so tools and agents stop re‑ingesting the<br/>
+  full history. Same outcome: less context, lower usage, cheaper follow‑ups,<br/>
+  and decisions you can still find—without deleting the archive.
 </p>
 
 <p align="center">
