@@ -1,0 +1,1276 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import zipfile
+from datetime import date
+from pathlib import Path
+
+HOME = Path.home()
+SHARE = HOME / ".local" / "share" / "chat-hygiene"
+CONFIG_DIR = HOME / ".config" / "chat-hygiene"
+CONFIG_PATH = CONFIG_DIR / "config.toml"
+STATE_PATH = CONFIG_DIR / "state.json"
+CURSOR_PROJECTS = HOME / ".cursor" / "projects"
+CLAUDE_PROJECTS = HOME / ".claude" / "projects"
+CODEX_SESSIONS = HOME / ".codex" / "sessions"
+
+SECRET_RE = re.compile(
+    r"(?i)(api[_-]?key|secret|token|password|authorization|bearer)\s*[:=]\s*\S+"
+)
+
+
+def unescape_json_fragment(text):
+    try:
+        return json.loads('"' + text + '"')
+    except json.JSONDecodeError:
+        return (
+            text.replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\r", "\r")
+            .replace('\\"', '"')
+            .replace("\\\\", "\\")
+        )
+
+
+def expand(path_str):
+    return Path(os.path.expanduser(str(path_str))).resolve()
+
+
+def load_config():
+    defaults = {
+        "folder_threshold_bytes": 2097152,
+        "jsonl_threshold_bytes": 1048576,
+        "backup_root": str(HOME / "Documents" / "chat-archives"),
+        "summary_root": str(SHARE / "summaries"),
+        "top_n": 10,
+        "extract_head_turns": 8,
+        "extract_tail_turns": 12,
+    }
+    if not CONFIG_PATH.is_file():
+        return defaults
+    cfg = dict(defaults)
+    for line in CONFIG_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        key = key.strip()
+        raw = raw.strip().strip('"').strip("'")
+        if key not in defaults:
+            continue
+        if isinstance(defaults[key], int):
+            cfg[key] = int(raw)
+        else:
+            cfg[key] = raw
+    return cfg
+
+
+def load_state():
+    if not STATE_PATH.is_file():
+        return {"dismissed": {}}
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        data = {"dismissed": {}}
+    if "dismissed" not in data or not isinstance(data["dismissed"], dict):
+        data["dismissed"] = {}
+    return data
+
+
+def save_state(state):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def human_bytes(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024.0 or unit == "GB":
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
+def approx_tokens(nbytes):
+    return int(nbytes) // 4
+
+
+def dir_size(path):
+    total = 0
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            fp = Path(root) / name
+            try:
+                total += fp.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def slug_from_path(path):
+    resolved = expand(path)
+    try:
+        rel = resolved.relative_to(HOME)
+        return str(rel).replace("\\", "-").replace("/", "-")
+    except ValueError:
+        parts = [p for p in resolved.parts if p not in ("/", "\\")]
+        return "-".join(parts).replace(":", "")
+
+
+def cursor_project_dir_for(cwd):
+    slug = slug_from_path(cwd)
+    candidate = CURSOR_PROJECTS / slug
+    if candidate.is_dir():
+        return candidate
+    resolved = expand(cwd)
+    resolved_s = str(resolved)
+    base = resolved.name
+    if not CURSOR_PROJECTS.is_dir():
+        return None
+    best = None
+    best_len = -1
+    for child in CURSOR_PROJECTS.iterdir():
+        if not child.is_dir():
+            continue
+        if not (child / "agent-transcripts").is_dir():
+            continue
+        name = child.name
+        score = -1
+        if name == slug:
+            score = 10_000 + len(name)
+        elif slug.startswith(name) or name in slug:
+            score = 1_000 + len(name)
+        elif name.replace("-", "/") in resolved_s:
+            score = 500 + len(name)
+        elif base and (name.endswith("-" + base) or name.endswith(base)):
+            score = 100 + len(name)
+        if score > best_len:
+            best = child
+            best_len = score
+    if best:
+        return best
+    return candidate if candidate.exists() else None
+
+
+def title_from_jsonl(jsonl_path, limit=120):
+    if not jsonl_path or not jsonl_path.is_file():
+        return "(empty)"
+    try:
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for _ in range(40):
+                line = fh.readline()
+                if not line:
+                    break
+                if "user_query" not in line and '"role":"user"' not in line:
+                    continue
+                m = re.search(r"<user_query>\s*(.*?)\s*</user_query>", line, re.DOTALL)
+                if m:
+                    text = unescape_json_fragment(m.group(1))
+                else:
+                    m2 = re.search(r'"text"\s*:\s*"((?:\\.|[^"\\])*)"', line)
+                    if not m2:
+                        continue
+                    text = unescape_json_fragment(m2.group(1))
+                text = re.sub(r"\s+", " ", text).strip()
+                text = SECRET_RE.sub(r"\1=[redacted]", text)
+                if len(text) > limit:
+                    text = text[: limit - 1] + "…"
+                return text or "(no title)"
+    except OSError:
+        pass
+    return "(unreadable)"
+
+
+def count_lines(path):
+    if not path or not path.is_file():
+        return 0
+    n = 0
+    try:
+        with path.open("rb") as fh:
+            for _ in fh:
+                n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def discover_cursor_chats(project_dir):
+    transcripts = project_dir / "agent-transcripts"
+    if not transcripts.is_dir():
+        return []
+    project_name = project_dir.name
+    chats = []
+    for child in sorted(transcripts.iterdir()):
+        if not child.is_dir():
+            continue
+        chat_id = child.name
+        main = child / f"{chat_id}.jsonl"
+        if not main.is_file():
+            jsonls = list(child.glob("*.jsonl"))
+            main = jsonls[0] if jsonls else None
+        folder_bytes = dir_size(child)
+        jsonl_bytes = main.stat().st_size if main and main.is_file() else 0
+        chats.append(
+            {
+                "tool": "cursor",
+                "project": project_name,
+                "chat_id": chat_id,
+                "path": child,
+                "jsonl_path": main,
+                "folder_bytes": folder_bytes,
+                "jsonl_bytes": jsonl_bytes,
+                "messages": count_lines(main) if main else 0,
+                "title": title_from_jsonl(main) if main else "(no jsonl)",
+            }
+        )
+    return chats
+
+
+def discover_claude_chats(cwd=None):
+    if not CLAUDE_PROJECTS.is_dir():
+        return []
+    chats = []
+    for child in sorted(CLAUDE_PROJECTS.iterdir()):
+        if not child.is_dir():
+            continue
+        for jsonl in sorted(child.glob("*.jsonl")):
+            chat_id = jsonl.stem
+            folder_bytes = jsonl.stat().st_size
+            chats.append(
+                {
+                    "tool": "claude",
+                    "project": child.name,
+                    "chat_id": chat_id,
+                    "path": jsonl,
+                    "jsonl_path": jsonl,
+                    "folder_bytes": folder_bytes,
+                    "jsonl_bytes": folder_bytes,
+                    "messages": count_lines(jsonl),
+                    "title": title_from_jsonl(jsonl),
+                }
+            )
+    return chats
+
+
+def discover_codex_chats():
+    if not CODEX_SESSIONS.is_dir():
+        return []
+    chats = []
+    for path in sorted(CODEX_SESSIONS.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix not in (".jsonl", ".json"):
+            continue
+        chat_id = path.stem
+        size = path.stat().st_size
+        entry = {
+            "tool": "codex",
+            "project": path.parent.name,
+            "chat_id": chat_id,
+            "path": path,
+            "jsonl_path": path,
+            "folder_bytes": size,
+            "jsonl_bytes": size,
+            "messages": count_lines(path),
+            "title": title_from_jsonl(path),
+        }
+        entry["ui_id"] = codex_thread_id(entry)
+        chats.append(entry)
+    return chats
+
+
+def collect_chats(cwd, all_projects=False):
+    chats = []
+    if all_projects:
+        if CURSOR_PROJECTS.is_dir():
+            for child in sorted(CURSOR_PROJECTS.iterdir()):
+                if child.is_dir() and (child / "agent-transcripts").is_dir():
+                    chats.extend(discover_cursor_chats(child))
+        chats.extend(discover_claude_chats())
+        chats.extend(discover_codex_chats())
+        return chats
+
+    project_dir = cursor_project_dir_for(cwd)
+    if project_dir and (project_dir / "agent-transcripts").is_dir():
+        chats.extend(discover_cursor_chats(project_dir))
+    else:
+        chats.extend(discover_claude_chats(cwd))
+        chats.extend(discover_codex_chats())
+    return chats
+
+
+def over_threshold(chat, cfg):
+    return (
+        chat["folder_bytes"] >= cfg["folder_threshold_bytes"]
+        or chat["jsonl_bytes"] >= cfg["jsonl_threshold_bytes"]
+    )
+
+
+def is_dismissed(chat, state):
+    key = f"{chat['tool']}:{chat['chat_id']}"
+    return key in state.get("dismissed", {})
+
+
+def short_ref(chat_id, n=8):
+    chat_id = str(chat_id)
+    if len(chat_id) <= n:
+        return chat_id
+    return chat_id[:n] + "…"
+
+
+def md_cell(text):
+    return str(text).replace("|", "/").replace("\n", " ").strip()
+
+
+def file_link_target(chat):
+    path = chat.get("jsonl_path") or chat.get("path")
+    if not path:
+        return ""
+    return Path(path).resolve().as_uri()
+
+
+def codex_thread_id(chat):
+    if chat.get("ui_id"):
+        return str(chat["ui_id"])
+    path = chat.get("jsonl_path") or chat.get("path")
+    if path and Path(path).is_file():
+        try:
+            with Path(path).open("r", encoding="utf-8", errors="replace") as fh:
+                for _ in range(40):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    payload = obj.get("payload") if isinstance(obj, dict) else None
+                    if isinstance(payload, dict) and payload.get("id"):
+                        return str(payload["id"])
+                    if isinstance(obj, dict) and obj.get("type") == "session_meta":
+                        meta = obj.get("payload") or obj
+                        if isinstance(meta, dict) and meta.get("id"):
+                            return str(meta["id"])
+                    if isinstance(obj, dict) and obj.get("id") and "session" in str(obj.get("type", "")).lower():
+                        return str(obj["id"])
+        except OSError:
+            pass
+    stem = str(chat.get("chat_id") or "")
+    m = re.search(
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+        stem,
+        re.I,
+    )
+    if m:
+        return m.group(1)
+    return stem
+
+
+def ui_link_target(chat):
+    tool = chat.get("tool")
+    if tool == "claude":
+        return f"claude://code/{chat['chat_id']}"
+    if tool == "codex":
+        return f"codex://threads/{codex_thread_id(chat)}"
+    return file_link_target(chat)
+
+
+def title_md_link(chat):
+    title = md_cell(chat.get("title") or "(no title)")
+    href = ui_link_target(chat)
+    if not href:
+        return f"**{title}**"
+    return f"[**{title}**]({href})"
+
+
+def ref_md_link(chat):
+    label = short_ref(chat["chat_id"])
+    href = file_link_target(chat)
+    if not href:
+        return f"`{label}`"
+    return f"[`{label}`]({href})"
+
+
+def ranked_chats(cwd, all_projects=False):
+    chats = collect_chats(cwd, all_projects=all_projects)
+    chats.sort(key=lambda c: c["folder_bytes"], reverse=True)
+    return chats
+
+
+def parse_rank_spec(spec):
+    spec = str(spec).strip()
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        start, end = int(a), int(b)
+    else:
+        start = end = int(spec)
+    if start < 1 or end < start:
+        raise SystemExit(f"invalid --rank {spec!r}; use e.g. 1-5 or 3")
+    return start, end
+
+
+def select_ranked(chats, top=None, rank=None):
+    if top is not None and rank is not None:
+        raise SystemExit("use only one of --top or --rank")
+    if top is not None:
+        if top < 1:
+            raise SystemExit("--top must be >= 1")
+        return list(enumerate(chats[:top], 1))
+    if rank is not None:
+        start, end = parse_rank_spec(rank)
+        return [(i, chats[i - 1]) for i in range(start, min(end, len(chats)) + 1)]
+    return list(enumerate(chats, 1))
+
+
+def find_chat(chat_id, cwd, chats=None):
+    needle = str(chat_id).rstrip("…").rstrip(".")
+    pool = chats if chats is not None else collect_chats(cwd, all_projects=True)
+    exact = [c for c in pool if c["chat_id"] == chat_id]
+    if not exact:
+        exact = [c for c in pool if c["chat_id"] == needle]
+    if exact:
+        matches = exact
+    else:
+        matches = [c for c in pool if c["chat_id"].startswith(needle)]
+    if not matches and chats is None:
+        local = collect_chats(cwd, all_projects=False)
+        return find_chat(chat_id, cwd, chats=local)
+    if not matches:
+        raise SystemExit(f"chat not found: {chat_id}")
+    if len(matches) > 1 and not exact:
+        ids = ", ".join(short_ref(c["chat_id"]) for c in matches[:8])
+        raise SystemExit(f"ambiguous ref {chat_id!r}; matches: {ids}")
+    if len(matches) > 1:
+        cursor_hits = [c for c in matches if c["tool"] == "cursor"]
+        if cursor_hits:
+            return cursor_hits[0]
+    return matches[0]
+
+
+def resolve_targets(args, cwd, cfg):
+    chats = ranked_chats(cwd, all_projects=getattr(args, "all", False))
+    top = getattr(args, "top", None)
+    rank = getattr(args, "rank", None)
+    ids = getattr(args, "chat_ids", None) or []
+    if getattr(args, "chat_id", None):
+        ids = list(ids) + [args.chat_id]
+    if top or rank:
+        selected = select_ranked(chats, top=top, rank=rank)
+        return [(rank_i, chat) for rank_i, chat in selected]
+    if ids:
+        out = []
+        for raw in ids:
+            chat = find_chat(raw, cwd, chats=chats)
+            rank_i = next((i for i, c in enumerate(chats, 1) if c["chat_id"] == chat["chat_id"]), 0)
+            out.append((rank_i, chat))
+        return out
+    raise SystemExit("provide chat id(s), or --top N, or --rank A-B")
+
+
+def cmd_report(args):
+    cfg = load_config()
+    cwd = expand(args.path or os.getcwd())
+    chats = ranked_chats(cwd, all_projects=args.all)
+    top_n = cfg["top_n"]
+    print("# Chat hygiene report")
+    print()
+    print(f"- Scope: `{'all projects' if args.all else cwd}`")
+    print(f"- Chats found: {len(chats)}")
+    print(
+        f"- Threshold: folder ≥ {human_bytes(cfg['folder_threshold_bytes'])} "
+        f"OR jsonl ≥ {human_bytes(cfg['jsonl_threshold_bytes'])}"
+    )
+    print()
+    print("| Rank | Title | Folder | Jsonl | ~Tokens | Msgs | Ref |")
+    print("|---:|---|---:|---:|---:|---:|---|")
+    show = chats[:top_n] if not args.all_rows else chats
+    for i, c in enumerate(show, 1):
+        flag = " ⚠" if over_threshold(c, cfg) else ""
+        print(
+            f"| {i} | {title_md_link(c)} | "
+            f"{human_bytes(c['folder_bytes'])}{flag} | {human_bytes(c['jsonl_bytes'])} | "
+            f"{approx_tokens(c['jsonl_bytes']):,} | {c['messages']} | {ref_md_link(c)} |"
+        )
+    top = chats[:top_n]
+    top_folder = sum(c["folder_bytes"] for c in top)
+    top_jsonl = sum(c["jsonl_bytes"] for c in top)
+    all_folder = sum(c["folder_bytes"] for c in chats)
+    all_jsonl = sum(c["jsonl_bytes"] for c in chats)
+    print(
+        f"| — | **Top {min(top_n, len(chats))} total** | "
+        f"**{human_bytes(top_folder)}** | **{human_bytes(top_jsonl)}** | "
+        f"**{approx_tokens(top_jsonl):,}** | — | — |"
+    )
+    print(
+        f"| — | **Overall total** ({len(chats)} chats) | "
+        f"**{human_bytes(all_folder)}** | **{human_bytes(all_jsonl)}** | "
+        f"**{approx_tokens(all_jsonl):,}** | — | — |"
+    )
+
+
+def cmd_check(args):
+    cfg = load_config()
+    state = load_state()
+    cwd = expand(args.path or os.getcwd())
+    chats = collect_chats(cwd, all_projects=args.all)
+    offenders = [
+        c
+        for c in chats
+        if over_threshold(c, cfg) and not is_dismissed(c, state)
+    ]
+    offenders.sort(key=lambda c: c["folder_bytes"], reverse=True)
+    if not offenders:
+        print("ok: no undismissed chats over threshold")
+        return 0
+    print(f"offenders: {len(offenders)}")
+    for c in offenders:
+        reasons = []
+        if c["folder_bytes"] >= cfg["folder_threshold_bytes"]:
+            reasons.append(f"folder {human_bytes(c['folder_bytes'])}")
+        if c["jsonl_bytes"] >= cfg["jsonl_threshold_bytes"]:
+            reasons.append(f"jsonl {human_bytes(c['jsonl_bytes'])}")
+        print(
+            f"- {ref_md_link(c)} ({', '.join(reasons)}) — {title_md_link(c)}"
+        )
+    return 1
+
+
+def cmd_dismiss(args):
+    state = load_state()
+    cwd = expand(getattr(args, "path", None) or os.getcwd())
+    cfg = load_config()
+    targets = resolve_targets(args, cwd, cfg)
+    for _rank_i, chat in targets:
+        key = f"{chat['tool']}:{chat['chat_id']}"
+        state["dismissed"][key] = {
+            "at": date.today().isoformat(),
+            "folder_bytes": chat["folder_bytes"],
+            "jsonl_bytes": chat["jsonl_bytes"],
+            "title": chat["title"],
+        }
+        print(f"dismissed {key} (`{short_ref(chat['chat_id'])}`)")
+    save_state(state)
+
+
+def cmd_undismiss(args):
+    state = load_state()
+    cwd = expand(getattr(args, "path", None) or os.getcwd())
+    cfg = load_config()
+    targets = resolve_targets(args, cwd, cfg)
+    for _rank_i, chat in targets:
+        key = f"{chat['tool']}:{chat['chat_id']}"
+        alt = chat["chat_id"]
+        removed = False
+        for candidate in (key, alt):
+            if candidate in state["dismissed"]:
+                del state["dismissed"][candidate]
+                print(f"undismissed {candidate}")
+                removed = True
+        if not removed:
+            prefix_keys = [k for k in state["dismissed"] if k.endswith(":" + chat["chat_id"])]
+            for candidate in prefix_keys:
+                del state["dismissed"][candidate]
+                print(f"undismissed {candidate}")
+                removed = True
+        if not removed:
+            print(f"not dismissed: {chat['chat_id']}", file=sys.stderr)
+    save_state(state)
+
+
+def redact(text):
+    return SECRET_RE.sub(r"\1=[redacted]", text)
+
+
+def extract_turns(jsonl_path, head_n, tail_n):
+    if not jsonl_path or not jsonl_path.is_file():
+        return []
+    turns = []
+    with jsonl_path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            role = "unknown"
+            if '"role":"user"' in line or "user_query" in line:
+                role = "user"
+            elif '"role":"assistant"' in line:
+                role = "assistant"
+            text = ""
+            m = re.search(r"<user_query>\s*(.*?)\s*</user_query>", line, re.DOTALL)
+            if m:
+                text = unescape_json_fragment(m.group(1))
+            else:
+                m2 = re.search(r'"text"\s*:\s*"((?:\\.|[^"\\])*)"', line)
+                if m2:
+                    text = unescape_json_fragment(m2.group(1))
+            text = redact(re.sub(r"\s+", " ", text).strip())
+            if not text:
+                text = f"[{role} turn, {len(line)} chars raw]"
+            if len(text) > 800:
+                text = text[:799] + "…"
+            turns.append((role, text))
+    if len(turns) <= head_n + tail_n:
+        return turns
+    return turns[:head_n] + [("…", f"[{len(turns) - head_n - tail_n} turns omitted]")] + turns[-tail_n:]
+
+
+MANIFEST_NAME = "CHAT_HYGIENE_MANIFEST.json"
+
+
+def print_snip(chat, cfg):
+    print(f"# Snip `{short_ref(chat['chat_id'])}`")
+    print(f"title: {title_md_link(chat)}")
+    print(f"full_id: `{chat['chat_id']}`")
+    print(f"original_path: `{Path(chat['path']).resolve()}`")
+    print(f"folder: {human_bytes(chat['folder_bytes'])}")
+    print(f"jsonl: {human_bytes(chat['jsonl_bytes'])}")
+    print()
+    turns = extract_turns(
+        chat["jsonl_path"],
+        cfg["extract_head_turns"],
+        cfg["extract_tail_turns"],
+    )
+    for role, text in turns:
+        print(f"## {role}")
+        print(text)
+        print()
+
+
+def cmd_snip(args):
+    cfg = load_config()
+    cwd = expand(getattr(args, "path", None) or os.getcwd())
+    for rank_i, chat in resolve_targets(args, cwd, cfg):
+        print(f"<!-- rank {rank_i} -->")
+        print_snip(chat, cfg)
+        print("---")
+
+
+def cmd_preview(args):
+    cfg = load_config()
+    cwd = expand(getattr(args, "path", None) or os.getcwd())
+    backup_root = expand(cfg["backup_root"])
+    summary_root = expand(cfg["summary_root"])
+    day = date.today().strftime("%Y%m%d")
+    print("# Preview (no changes)")
+    print()
+    print("`--summary` on **compress** is an INPUT: the ultra-squeeze markdown already written.")
+    print("`preview` shows a snip + from→to paths. Nothing is zipped, moved, or deleted.")
+    print()
+    for rank_i, chat in resolve_targets(args, cwd, cfg):
+        original = Path(chat["path"]).resolve()
+        backup_zip = backup_root / chat["tool"] / chat["project"] / f"{chat['chat_id']}-{day}.zip"
+        manifest_path = backup_zip.with_suffix(".manifest.json")
+        summary_dest = summary_root / chat["tool"] / chat["project"] / f"{chat['chat_id']}.md"
+        print(f"## Rank {rank_i} — {title_md_link(chat)}")
+        print(f"- ref: `{short_ref(chat['chat_id'])}`")
+        print(f"- full_id: `{chat['chat_id']}`")
+        print(f"- from (original): `{original}`")
+        print(f"- to (zip): `{backup_zip}`")
+        print(f"- manifest: `{manifest_path}`")
+        print(f"- summary: `{summary_dest}`")
+        print(f"- folder: {human_bytes(chat['folder_bytes'])} / jsonl: {human_bytes(chat['jsonl_bytes'])}")
+        print()
+        print_snip(chat, cfg)
+        print("---")
+
+
+def cmd_select(args):
+    cfg = load_config()
+    cwd = expand(getattr(args, "path", None) or os.getcwd())
+    targets = resolve_targets(args, cwd, cfg)
+    for rank_i, chat in targets:
+        print(f"{rank_i}\t{chat['chat_id']}\t{short_ref(chat['chat_id'])}\t{md_cell(chat['title'])}")
+
+
+def render_template(template_text, mapping):
+    out = template_text
+    for key, value in mapping.items():
+        out = out.replace("{{" + key + "}}", str(value))
+    return out
+
+
+def build_manifest(chat, backup_zip, summary_dest, manifest_path):
+    original = Path(chat["path"]).resolve()
+    jsonl = Path(chat["jsonl_path"]).resolve() if chat.get("jsonl_path") else None
+    kind = "file" if original.is_file() else "directory"
+    return {
+        "schema": "chat-hygiene/v1",
+        "chat_id": chat["chat_id"],
+        "tool": chat["tool"],
+        "project": chat["project"],
+        "title": chat.get("title") or "",
+        "compressed_at": date.today().isoformat(),
+        "original_path": str(original),
+        "original_jsonl_path": str(jsonl) if jsonl else "",
+        "original_kind": kind,
+        "original_parent": str(original.parent),
+        "backup_zip": str(backup_zip),
+        "manifest_path": str(manifest_path),
+        "summary_path": str(summary_dest),
+        "folder_bytes": chat["folder_bytes"],
+        "jsonl_bytes": chat["jsonl_bytes"],
+        "messages": chat.get("messages", 0),
+    }
+
+
+def write_zip_with_manifest(src, dest_zip, manifest):
+    dest_zip.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(dest_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(MANIFEST_NAME, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        src = Path(src)
+        if src.is_file():
+            zf.write(src, arcname=src.name)
+            return
+        for root, _dirs, files in os.walk(src):
+            for name in files:
+                fp = Path(root) / name
+                arc = fp.relative_to(src.parent)
+                zf.write(fp, arcname=str(arc))
+
+
+def clear_dir_contents(path):
+    path = Path(path)
+    if path.is_file():
+        path.unlink()
+        return
+    for child in list(path.iterdir()):
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def resolve_summary_file(chat, args):
+    if getattr(args, "summary", None):
+        path = expand(args.summary)
+        if path.is_file():
+            return path
+        raise SystemExit(f"summary file not found: {path}")
+    summary_dir = getattr(args, "summary_dir", None)
+    if summary_dir:
+        root = expand(summary_dir)
+        candidates = [
+            root / f"{chat['chat_id']}.md",
+            root / f"{short_ref(chat['chat_id']).rstrip('…')}.md",
+            root / f"{chat['chat_id'][:8]}.md",
+        ]
+        for path in candidates:
+            if path.is_file():
+                return path
+        raise SystemExit(
+            f"no summary for `{short_ref(chat['chat_id'])}` under {root} "
+            f"(expected {chat['chat_id']}.md)"
+        )
+    raise SystemExit(
+        "compress needs an input summary: pass --summary <file.md> "
+        "(single chat) or --summary-dir <dir> (batch; one <chat-id>.md per chat)"
+    )
+
+
+def append_restore_block(summary_text, manifest):
+    block = (
+        "\n\n## Backup / restore\n\n"
+        f"- **From (original path):** `{manifest['original_path']}`\n"
+        f"- **To (zip):** `{manifest['backup_zip']}`\n"
+        f"- **Manifest:** `{manifest['manifest_path']}`\n"
+        f"- **Expand with:** `chat-hygiene expand --zip {manifest['backup_zip']}`\n"
+    )
+    if re.search(r"(?im)^##\s+backup\s*/\s*restore\s*$", summary_text):
+        return summary_text
+    return summary_text.rstrip() + block
+
+
+def compress_one(chat, summary_src, cfg):
+    summary_text = summary_src.read_text(encoding="utf-8")
+    if len(summary_text.encode("utf-8")) > 64 * 1024:
+        raise SystemExit(
+            f"summary too large for `{short_ref(chat['chat_id'])}` (>64KB); keep ultra-squeeze under a few KB"
+        )
+
+    backup_root = expand(cfg["backup_root"])
+    summary_root = expand(cfg["summary_root"])
+    day = date.today().strftime("%Y%m%d")
+    backup_dir = backup_root / chat["tool"] / chat["project"]
+    backup_zip = backup_dir / f"{chat['chat_id']}-{day}.zip"
+    manifest_path = backup_zip.with_suffix(".manifest.json")
+    summary_dir = summary_root / chat["tool"] / chat["project"]
+    summary_dest = summary_dir / f"{chat['chat_id']}.md"
+    original = Path(chat["path"]).resolve()
+
+    manifest = build_manifest(chat, backup_zip, summary_dest, manifest_path)
+    print(f"compress `{short_ref(chat['chat_id'])}`")
+    print(f"  from: {original}")
+    print(f"  to:   {backup_zip}")
+    write_zip_with_manifest(chat["path"], backup_zip, manifest)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"  manifest: {manifest_path}")
+
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_text = append_restore_block(summary_text, manifest)
+    summary_dest.write_text(summary_text, encoding="utf-8")
+    print(f"  summary: {summary_dest}")
+
+    stub_template = (SHARE / "templates" / "stub.jsonl").read_text(encoding="utf-8")
+    stub = render_template(
+        stub_template,
+        {
+            "summary_path": str(summary_dest),
+            "backup_path": str(backup_zip),
+            "manifest_path": str(manifest_path),
+            "original_path": str(original),
+            "chat_id": chat["chat_id"],
+        },
+    )
+
+    if chat["tool"] == "cursor":
+        chat_dir = Path(chat["path"])
+        clear_dir_contents(chat_dir)
+        main = chat_dir / f"{chat['chat_id']}.jsonl"
+        main.write_text(stub, encoding="utf-8")
+        print(f"  stub: {main}")
+    else:
+        path = Path(chat["path"])
+        if path.is_file():
+            path.write_text(stub, encoding="utf-8")
+            print(f"  stub: {path}")
+        else:
+            clear_dir_contents(path)
+            (path / f"{chat['chat_id']}.jsonl").write_text(stub, encoding="utf-8")
+
+    print(f"compress complete `{short_ref(chat['chat_id'])}`")
+
+
+def cmd_compress(args):
+    cfg = load_config()
+    cwd = expand(getattr(args, "path", None) or os.getcwd())
+    targets = resolve_targets(args, cwd, cfg)
+    if len(targets) > 1 and getattr(args, "summary", None) and not getattr(args, "summary_dir", None):
+        raise SystemExit("batch compress needs --summary-dir (one <chat-id>.md per chat), not a single --summary")
+    for rank_i, chat in targets:
+        print(f"## compress rank {rank_i} — {title_md_link(chat)}")
+        summary_src = resolve_summary_file(chat, args)
+        compress_one(chat, summary_src, cfg)
+        print("---")
+
+
+def load_manifest_from_zip(zip_file):
+    with zipfile.ZipFile(zip_file, "r") as zf:
+        if MANIFEST_NAME in zf.namelist():
+            return json.loads(zf.read(MANIFEST_NAME).decode("utf-8"))
+    sidecar = zip_file.with_suffix(".manifest.json")
+    if sidecar.is_file():
+        return json.loads(sidecar.read_text(encoding="utf-8"))
+    return None
+
+
+def member_files_excluding_manifest(zf):
+    return [n for n in zf.namelist() if n != MANIFEST_NAME and not n.endswith("/")]
+
+
+def cmd_expand(args):
+    zip_file = expand(args.zip)
+    if not zip_file.is_file():
+        raise SystemExit(f"zip not found: {zip_file}")
+
+    manifest = load_manifest_from_zip(zip_file)
+    if args.chat_id and manifest and manifest.get("chat_id"):
+        needle = str(args.chat_id).rstrip("…").rstrip(".")
+        full = str(manifest["chat_id"])
+        if not (full == needle or full.startswith(needle) or needle in full):
+            raise SystemExit(f"zip chat_id {full} does not match requested {args.chat_id}")
+
+    if manifest and manifest.get("original_path"):
+        original = Path(manifest["original_path"])
+        kind = manifest.get("original_kind") or ("file" if original.suffix else "directory")
+        print(f"expand using manifest")
+        print(f"  from zip: {zip_file}")
+        print(f"  to original: {original}")
+        print(f"  kind: {kind}")
+
+        with zipfile.ZipFile(zip_file, "r") as zf:
+            members = member_files_excluding_manifest(zf)
+            if kind == "file":
+                original.parent.mkdir(parents=True, exist_ok=True)
+                if original.exists():
+                    if original.is_dir():
+                        clear_dir_contents(original)
+                        original.rmdir()
+                    else:
+                        original.unlink()
+                if len(members) == 1:
+                    with zf.open(members[0]) as src, original.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                else:
+                    tmp_parent = original.parent
+                    for name in members:
+                        target = tmp_parent / Path(name).name
+                        with zf.open(name) as src, target.open("wb") as dst:
+                            shutil.copyfileobj(src, dst)
+            else:
+                if original.exists():
+                    if original.is_file():
+                        original.unlink()
+                    else:
+                        clear_dir_contents(original)
+                else:
+                    original.mkdir(parents=True, exist_ok=True)
+                parent = original.parent
+                for name in members:
+                    info = zf.getinfo(name)
+                    # zip stores arcs relative to parent of chat folder
+                    out = parent / name
+                    if str(out.resolve()).startswith(str(parent.resolve())):
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(info) as src, out.open("wb") as dst:
+                            shutil.copyfileobj(src, dst)
+        print(f"expand complete -> {original}")
+        return
+
+    if not args.chat_id:
+        raise SystemExit(
+            "zip has no CHAT_HYGIENE_MANIFEST.json / sidecar; pass chat id and we restore via live path lookup"
+        )
+    cwd = expand(getattr(args, "path", None) or os.getcwd())
+    chat = find_chat(args.chat_id, cwd)
+    dest = Path(chat["path"]).resolve()
+    print(f"expand without manifest (legacy)")
+    print(f"  from zip: {zip_file}")
+    print(f"  to: {dest}")
+    if dest.is_file():
+        parent = dest.parent
+        dest.unlink()
+        with zipfile.ZipFile(zip_file, "r") as zf:
+            for name in member_files_excluding_manifest(zf):
+                out = parent / Path(name).name
+                with zf.open(name) as src, out.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        print(f"expand complete -> {parent}")
+        return
+    if dest.exists():
+        clear_dir_contents(dest)
+    else:
+        dest.mkdir(parents=True, exist_ok=True)
+    parent = dest.parent
+    with zipfile.ZipFile(zip_file, "r") as zf:
+        for name in member_files_excluding_manifest(zf):
+            out = parent / name
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(name) as src, out.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+    print(f"expand complete -> {dest}")
+
+
+def add_target_args(parser):
+    parser.add_argument(
+        "chat_ids",
+        nargs="*",
+        help="Full chat id(s) or short ref prefix(es); optional if --top/--rank set",
+    )
+    parser.add_argument("--top", type=int, help="Select top N by folder size")
+    parser.add_argument("--rank", help="Select ranks, e.g. 1-5 or 3")
+    parser.add_argument("--all", action="store_true", help="Select across all projects")
+    parser.add_argument(
+        "--path",
+        dest="path",
+        default=None,
+        help="Project path (default: cwd)",
+    )
+
+
+HELP_PATH = SHARE / "HELP.md"
+
+HELP_TOPICS = {
+    "overview": "what it does",
+    "what": "what it does",
+    "stack": "tech stack",
+    "tech": "tech stack",
+    "architecture": "architecture",
+    "arch": "architecture",
+    "diagram": "architecture",
+    "report": "report",
+    "r": "report",
+    "check": "check",
+    "c": "check",
+    "preview": "preview",
+    "p": "preview",
+    "dry-run": "preview",
+    "snip": "snip",
+    "x": "snip",
+    "sample": "snip",
+    "extract": "snip",
+    "compress": "compress",
+    "zip": "compress",
+    "z": "compress",
+    "compact": "compress",
+    "expand": "expand",
+    "unzip": "expand",
+    "restore": "expand",
+    "dismiss": "dismiss / undismiss",
+    "d": "dismiss / undismiss",
+    "undismiss": "dismiss / undismiss",
+    "ud": "dismiss / undismiss",
+    "select": "select",
+    "s": "select",
+    "examples": "examples",
+    "example": "examples",
+    "naming": "naming",
+    "paths": "paths",
+    "agents": "agents",
+    "selection": "selection flags",
+    "flags": "selection flags",
+}
+
+
+def load_help_text():
+    if HELP_PATH.is_file():
+        return HELP_PATH.read_text(encoding="utf-8")
+    return (
+        "# chat-hygiene\n\n"
+        "HELP.md missing. Try: chat-hygiene report | check | preview | compress | expand\n"
+        f"Expected guide at: {HELP_PATH}\n"
+    )
+
+
+def help_section(text, heading):
+    lines = text.splitlines()
+    needle = f"## {heading}".lower()
+    start = None
+    for i, line in enumerate(lines):
+        stripped = line.strip().lower()
+        if stripped == needle or stripped.startswith(needle + " ") or stripped.startswith(needle + "("):
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("## ") and not lines[j].startswith("### "):
+            end = j
+            break
+    return "\n".join(lines[start:end]).rstrip() + "\n"
+
+
+def cmd_help(args):
+    text = load_help_text()
+    topic = (getattr(args, "topic", None) or "").strip().lower()
+    if not topic:
+        print(text, end="" if text.endswith("\n") else "\n")
+        return
+    mapped = HELP_TOPICS.get(topic, topic)
+    section = help_section(text, mapped)
+    if section is None:
+        known = ", ".join(sorted(set(HELP_TOPICS.values())))
+        raise SystemExit(
+            f"unknown help topic: {topic!r}\n"
+            f"try: chat-hygiene help\n"
+            f"topics: {known}"
+        )
+    print(f"# chat-hygiene help — {mapped}\n")
+    print(section, end="" if section.endswith("\n") else "\n")
+    print("Full guide: chat-hygiene help")
+
+
+CLI_HELP_BANNER = """\
+chat-hygiene — report / compress / expand oversized coding-agent chats
+(Cursor, Claude Code, Codex). Python 3 stdlib only. No pip deps.
+
+What it does
+  report   ranked sizes (title + ref links)
+  check    undismissed chats over threshold (folder ≥2MiB OR jsonl ≥1MiB)
+  preview  dry-run from→to + snip (no changes)
+  snip     sample turns to write an ultra-summary
+  compress zip + manifest + summary + stub   (needs --summary INPUT)
+  expand   restore original_path from zip
+  dismiss  stop nudges for a chat id
+
+Tech stack
+  Language     Python 3 (argparse, pathlib, json, zipfile, re)
+  Install      ~/.local/bin/chat-hygiene  →  ~/.local/share/chat-hygiene/
+  Config       ~/.config/chat-hygiene/   (thresholds, dismissals)
+  Backups      ~/Documents/chat-archives/<tool>/<project>/
+  Summaries    ~/.local/share/chat-hygiene/summaries/
+
+Architecture
+                         ┌─────────────────────┐
+                         │  You / coding agent │
+                         └──────────┬──────────┘
+                                    │
+                         chat-hygiene <cmd>
+                                    │
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │   CLI  (Python 3, stdlib)     │
+                    │   ~/.local/bin/chat-hygiene   │
+                    └───────────────┬───────────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              │                     │                     │
+              ▼                     ▼                     ▼
+       ┌─────────────┐       ┌─────────────┐       ┌─────────────┐
+       │  Discover   │       │   Config    │       │  Commands   │
+       └──────┬──────┘       └──────┬──────┘       └──────┬──────┘
+              │                     │                     │
+              │                     ▼                     │
+              │            ~/.config/chat-hygiene/        │
+              │              • thresholds                 │
+              │              • dismissals                 │
+              │                                           │
+              ▼                                           ▼
+   ┌────────────────────┐              ┌──────────────────────────────┐
+   │ Chat stores        │   report /   │  inspect                     │
+   │                    │   check  ──► │  preview · snip              │
+   │ Cursor  ~/.cursor/ │              └──────────────────────────────┘
+   │ Claude  ~/.claude/ │
+   │ Codex   ~/.codex/  │              ┌──────────────────────────────┐
+   └─────────┬──────────┘   compress ► │  1. zip original             │
+             │                         │  2. write manifest (from→to) │
+             │                         │  3. write ultra-summary      │
+             │                         │  4. leave tiny stub in place │
+             │                         └──────────────┬───────────────┘
+             │                                        │
+             │                                        ▼
+             │                         ~/Documents/chat-archives/
+             │                           <tool>/<project>/
+             │                             *.zip
+             │                             *.manifest.json
+             │                                        │
+             │◄────────────── expand ─────────────────┘
+             │              (restore original_path)
+             │
+             ▼
+   ~/.local/share/chat-hygiene/summaries/
+     <tool>/<project>/<id>.md
+
+
+   Thin wrappers (not core runtime)
+   ────────────────────────────────
+   HELP.md · skill · adapters · shell completions · templates
+
+Full narrative guide:  chat-hygiene help
+"""
+
+
+class CliHelpParser(argparse.ArgumentParser):
+    def print_help(self, file=None):
+        file = sys.stdout if file is None else file
+        file.write(CLI_HELP_BANNER)
+        if not CLI_HELP_BANNER.endswith("\n"):
+            file.write("\n")
+        file.write("\n")
+        super().print_help(file)
+
+
+def build_parser():
+    p = CliHelpParser(
+        prog="chat-hygiene",
+        description="Report and compress oversized coding-agent chats.",
+        epilog="Examples:  chat-hygiene help  |  chat-hygiene report  |  chat-hygiene preview --top 3",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="cmd", required=False)
+
+    h = sub.add_parser(
+        "help",
+        aliases=["h", "doc", "docs"],
+        help="Full guide with examples (try: chat-hygiene help compress)",
+    )
+    h.add_argument(
+        "topic",
+        nargs="?",
+        default=None,
+        help="Optional topic: report, compress, expand, examples, naming, …",
+    )
+    h.set_defaults(func=cmd_help)
+
+    r = sub.add_parser("report", aliases=["r"], help="Rank chats by size")
+    r.add_argument("path", nargs="?", default=None)
+    r.add_argument("--all", action="store_true", help="All discovered projects")
+    r.add_argument("--all-rows", action="store_true", help="Print every chat, not only top_n")
+    r.set_defaults(func=cmd_report)
+
+    c = sub.add_parser("check", aliases=["c"], help="List undismissed chats over threshold")
+    c.add_argument("path", nargs="?", default=None)
+    c.add_argument("--all", action="store_true")
+    c.set_defaults(func=lambda a: sys.exit(cmd_check(a)))
+
+    d = sub.add_parser("dismiss", aliases=["d"], help="Never nudge these chat id(s) again")
+    add_target_args(d)
+    d.set_defaults(func=cmd_dismiss)
+
+    und = sub.add_parser("undismiss", aliases=["ud"], help="Clear dismissal(s)")
+    add_target_args(und)
+    und.set_defaults(func=cmd_undismiss)
+
+    sn = sub.add_parser(
+        "snip",
+        aliases=["x", "sample", "extract"],
+        help="Sample head/tail turns (to write a summary). Not unzip.",
+    )
+    add_target_args(sn)
+    sn.set_defaults(func=cmd_snip)
+
+    prev = sub.add_parser(
+        "preview",
+        aliases=["p", "dry-run"],
+        help="Dry-run: show from→to paths + snip; does NOT compress",
+    )
+    add_target_args(prev)
+    prev.set_defaults(func=cmd_preview)
+
+    sel = sub.add_parser("select", aliases=["s"], help="Print selected ids (for scripts/batches)")
+    add_target_args(sel)
+    sel.set_defaults(func=cmd_select)
+
+    z = sub.add_parser(
+        "compress",
+        aliases=["zip", "z", "compact"],
+        help="Zip chat to archive, write summary, replace with stub. Needs --summary INPUT.",
+    )
+    add_target_args(z)
+    z.add_argument(
+        "--summary",
+        help="INPUT path to one ultra-squeeze .md (single chat). Not a dry-run flag.",
+    )
+    z.add_argument(
+        "--summary-dir",
+        help="INPUT directory with <chat-id>.md files (batch / --top / --rank)",
+    )
+    z.set_defaults(func=cmd_compress)
+
+    ex = sub.add_parser(
+        "expand",
+        aliases=["unzip", "restore"],
+        help="Restore a chat from zip to its original path (uses manifest)",
+    )
+    ex.add_argument("chat_id", nargs="?", default=None, help="Optional; used to verify zip or legacy restore")
+    ex.add_argument("--zip", required=True, help="Backup zip path")
+    ex.add_argument("--path", default=None, help="Project path for legacy lookup")
+    ex.set_defaults(func=cmd_expand)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        cmd_help(argparse.Namespace(topic=None))
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
+
+
