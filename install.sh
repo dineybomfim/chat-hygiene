@@ -1,28 +1,97 @@
 #!/bin/sh
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+REPO_HTTPS="${CHAT_HYGIENE_REPO:-https://github.com/dineybomfim/chat-hygiene}"
+REF="${CHAT_HYGIENE_REF:-main}"
 SHARE="${HOME}/.local/share/chat-hygiene"
 BIN_DIR="${HOME}/.local/bin"
 CONFIG_DIR="${HOME}/.config/chat-hygiene"
 SKILL_DIR="${HOME}/.cursor/skills/chat-hygiene"
 ARCHIVES="${HOME}/Documents/chat-archives"
 
+ROOT=""
+FETCH_DIR=""
+
+cleanup() {
+  if [ -n "${FETCH_DIR}" ] && [ -d "${FETCH_DIR}" ]; then
+    rm -rf "${FETCH_DIR}"
+  fi
+}
+trap cleanup EXIT INT HUP TERM
+
 need_python() {
   if command -v python3 >/dev/null 2>&1; then
     return 0
   fi
   echo "chat-hygiene needs python3 on PATH." >&2
-  echo "Install Python 3, then re-run: sh install.sh" >&2
+  echo "Install Python 3, then re-run this installer." >&2
   exit 1
+}
+
+resolve_local_root() {
+  script="$0"
+  case "${script}" in
+    /*) ;;
+    *)
+      if [ -f "${script}" ]; then
+        script="$(CDPATH= cd -- "$(dirname "${script}")" && pwd)/$(basename "${script}")"
+      else
+        return 1
+      fi
+      ;;
+  esac
+  dir="$(CDPATH= cd -- "$(dirname "${script}")" && pwd)"
+  if [ -f "${dir}/bin/chat-hygiene" ]; then
+    ROOT="${dir}"
+    return 0
+  fi
+  return 1
+}
+
+fetch_root() {
+  FETCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/chat-hygiene-install.XXXXXX")"
+  src="${FETCH_DIR}/src"
+  mkdir -p "${src}"
+
+  echo "Fetching ${REPO_HTTPS} @ ${REF} …"
+
+  if command -v git >/dev/null 2>&1; then
+    git clone --depth 1 --branch "${REF}" "${REPO_HTTPS}.git" "${src}"
+  elif command -v curl >/dev/null 2>&1; then
+    archive="${FETCH_DIR}/src.tgz"
+    curl -fsSL "${REPO_HTTPS}/archive/refs/heads/${REF}.tar.gz" -o "${archive}"
+    tar -xzf "${archive}" -C "${FETCH_DIR}"
+    extracted=""
+    for candidate in "${FETCH_DIR}"/chat-hygiene-*; do
+      if [ -d "${candidate}" ] && [ -f "${candidate}/bin/chat-hygiene" ]; then
+        extracted="${candidate}"
+        break
+      fi
+    done
+    if [ -z "${extracted}" ]; then
+      echo "Download did not contain bin/chat-hygiene." >&2
+      exit 1
+    fi
+    rm -rf "${src}"
+    mv "${extracted}" "${src}"
+  else
+    echo "Need git or curl to install from GitHub." >&2
+    exit 1
+  fi
+
+  if [ ! -f "${src}/bin/chat-hygiene" ]; then
+    echo "Fetched tree is missing bin/chat-hygiene." >&2
+    exit 1
+  fi
+  ROOT="${src}"
 }
 
 need_python
 
-if [ ! -f "${ROOT}/bin/chat-hygiene" ]; then
-  echo "Missing ${ROOT}/bin/chat-hygiene" >&2
-  echo "Run this script from a clone of the chat-hygiene repo." >&2
-  exit 1
+if resolve_local_root; then
+  echo "Installing from local checkout: ${ROOT}"
+else
+  fetch_root
 fi
 
 mkdir -p \
@@ -36,7 +105,6 @@ mkdir -p \
   "${ARCHIVES}" \
   "${SKILL_DIR}"
 
-# Copy project files into the runtime install. Keep existing summaries/.
 for item in bin adapters completions templates lib HELP.md README.md; do
   if [ -e "${ROOT}/${item}" ]; then
     rm -rf "${SHARE}/${item}"

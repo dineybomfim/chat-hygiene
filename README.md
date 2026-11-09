@@ -6,7 +6,17 @@ Python 3 stdlib only. No pip packages. Installs into your home folder (no admin)
 
 ## Install
 
-Requires **Python 3**.
+Requires **Python 3**. Same `install.sh` works from a clone or straight from GitHub.
+
+### One-liner (fetch → install → cleanup)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dineybomfim/chat-hygiene/main/install.sh | sh
+```
+
+That downloads the repo to a temp folder, installs into your home, then deletes the temp folder. Nothing is left except the runtime under `~/.local/…`.
+
+### From a local clone
 
 ```sh
 git clone https://github.com/dineybomfim/chat-hygiene.git
@@ -14,7 +24,7 @@ cd chat-hygiene
 sh install.sh
 ```
 
-That copies the tool into `~/.local/share/chat-hygiene`, puts `chat-hygiene` on `~/.local/bin`, and links the Cursor skill.
+Both paths copy the tool into `~/.local/share/chat-hygiene`, put `chat-hygiene` on `~/.local/bin`, and link the Cursor skill.
 
 Then open a **new** terminal and run:
 
@@ -29,6 +39,12 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ### Update
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dineybomfim/chat-hygiene/main/install.sh | sh
+```
+
+Or from a clone you keep around:
 
 ```sh
 cd chat-hygiene
