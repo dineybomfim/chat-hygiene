@@ -8,21 +8,9 @@
   <strong>Stop paying tokens for chats you already finished.</strong>
 </p>
 
-<p align="center">
-  Coding agents (Cursor, Claude Code, Codex) keep every turn on disk. A long<br/>
-  thread becomes a multi‑megabyte transcript: slower IDE/indexing, more disk,<br/>
-  and—worst—huge @‑attachments and agent re‑reads that burn <strong>context window</strong><br/>
-  and <strong>API tokens</strong> on noise you no longer need. Past decisions get buried in<br/>
-  the raw log instead of a short, reusable summary.
-</p>
+Coding agents (Cursor, Claude Code, Codex) keep every turn on disk. A long thread becomes a multi‑megabyte transcript: slower IDE/indexing, more disk, and—worst—huge @‑attachments and agent re‑reads that burn **context window** and **API tokens** on noise you no longer need. Past decisions get buried in the raw log instead of a short, reusable summary.
 
-<p align="center">
-  <strong>chat-hygiene</strong> ranks oversized chats, helps you <strong>summarize</strong> what mattered,<br/>
-  then <strong>compresses</strong> the original to a zip + ultra‑summary (with a restore<br/>
-  manifest) and leaves a tiny stub so tools and agents stop re‑ingesting the<br/>
-  full history. Same outcome: less context, lower usage, cheaper follow‑ups,<br/>
-  and decisions you can still find—without deleting the archive.
-</p>
+**chat-hygiene** ranks oversized chats, helps you **summarize** what mattered, then **compresses** the original to a zip + ultra‑summary (with a restore manifest) and leaves a tiny stub so tools and agents stop re‑ingesting the full history. Same outcome: less context, lower usage, cheaper follow‑ups, and decisions you can still find—without deleting the archive.
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3%20stdlib-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3 stdlib" />
